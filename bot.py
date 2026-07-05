@@ -9,9 +9,10 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile
+    FSInputFile, WebAppInfo
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -27,6 +28,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "")
  
 if not BOT_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or ADMIN_ID == 0:
     raise RuntimeError(
@@ -207,10 +209,37 @@ async def start_handler(message: Message):
         await message.answer("🛠 Hozir texnik ishlar olib borilmoqda. Iltimos, keyinroq qayting.")
         return
  
-    caption = f"🏆 <b>{BOT_NAME}</b>\n\neFootball turnirlar botiga xush kelibsiz!"
+    caption = f"🏆 <b>{BOT_NAME}</b>\n\neFootball turnirlar botiga xush kelibsiz!\nQuyidagi tugma orqali ilovani oching 👇"
+ 
+    if WEBAPP_URL:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎮 Ilovani ochish", web_app=WebAppInfo(url=WEBAPP_URL))]
+        ])
+        await message.answer(caption, parse_mode="HTML", reply_markup=kb)
+    else:
+        await message.answer(caption, parse_mode="HTML", reply_markup=main_menu_kb(message.from_user.id))
+ 
+ 
+@dp.message(Command("admin"))
+async def admin_command(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    settings = db_get_settings()
+    total = db_total_users()
+    tour = db_get_active_tournament()
+    active_count = db_count_participants(tour["id"]) if tour else 0
+ 
+    text = (
+        f"⚙️ <b>Admin panel</b>\n\n"
+        f"👥 Umumiy foydalanuvchilar: {total}\n"
+        f"🎮 Faol qatnashuvchilar: {active_count}\n"
+        f"🛠 Texnik ishlar: {'YOQILGAN' if settings['maintenance'] else 'O\u02bbCHIRILGAN'}\n"
+    )
+    if tour:
+        text += f"🏆 Faol turnir: {tour['size']} talik ({tour['status']})\n"
+ 
     await message.answer(
-        caption, parse_mode="HTML",
-        reply_markup=main_menu_kb(message.from_user.id)
+        text, parse_mode="HTML", reply_markup=admin_menu_kb(settings["maintenance"])
     )
  
  
