@@ -212,7 +212,7 @@ async def start_handler(message: Message):
     settings = db_get_settings()
  
     if settings["maintenance"] and message.from_user.id != ADMIN_ID:
-        msg = settings.get("maintenance_message") or "Hozir texnik ishlar olib borilmoqda. Iltimos, keyinroq qayting."
+        msg = settings.get("maintenance_message") or "Texnik ishlar boshlandi. Iltimos, birozdan keyin urinib ko'ring."
         await message.answer(f"🛠 {msg}")
         return
  
