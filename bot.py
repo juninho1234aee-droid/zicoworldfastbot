@@ -450,6 +450,7 @@ async def receive_deadline(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ {size} talik turnir boshlandi!\nMuddat: {hours} soat")
     await broadcast_tournament(tour)
+    sb.table("tournaments").update({"broadcasted": True}).eq("id", tour["id"]).execute()
  
  
 @dp.callback_query(F.data == "stop_tournament")
@@ -552,9 +553,38 @@ async def restore_jobs():
             )
  
  
+async def sync_tournaments():
+    """
+    Har 30 soniyada tekshiradi: Mini App (webapp) orqali admin yangi turnir
+    yaratgan bo'lsa, buni bot avtomatik payqab, hammaga xabar yuboradi va
+    muddat tugaganda qura tashlashni rejalashtiradi.
+    """
+    try:
+        r = sb.table("tournaments").select("*").eq("status", "registration").execute()
+        for tour in r.data:
+            job_id = f"draw_{tour['id']}"
+            deadline = datetime.fromisoformat(tour["deadline"].replace("Z", "+00:00")).replace(tzinfo=None)
+ 
+            if not scheduler.get_job(job_id):
+                if deadline <= datetime.utcnow():
+                    await run_draw(tour["id"])
+                else:
+                    scheduler.add_job(
+                        run_draw, "date", run_date=deadline,
+                        args=[tour["id"]], id=job_id, replace_existing=True
+                    )
+ 
+            if not tour.get("broadcasted"):
+                await broadcast_tournament(tour)
+                sb.table("tournaments").update({"broadcasted": True}).eq("id", tour["id"]).execute()
+    except Exception as e:
+        logging.warning(f"sync_tournaments xato: {e}")
+ 
+ 
 async def main():
     db_get_settings()
     await restore_jobs()
+    scheduler.add_job(sync_tournaments, "interval", seconds=30, id="sync_tournaments")
     scheduler.start()
     logging.info("Bot ishga tushdi...")
     await dp.start_polling(bot)
