@@ -29,6 +29,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
+MATCH_PLAY_HOURS = float(os.getenv("MATCH_PLAY_HOURS", "24"))
  
 if not BOT_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or ADMIN_ID == 0:
     raise RuntimeError(
@@ -136,6 +137,7 @@ def db_all_users():
  
 def db_save_matches(tid: int, pairs):
     rows = []
+    match_deadline = (datetime.utcnow() + timedelta(hours=MATCH_PLAY_HOURS)).isoformat()
     for p1, p2 in pairs:
         rows.append({
             "tournament_id": tid,
@@ -143,9 +145,13 @@ def db_save_matches(tid: int, pairs):
             "player1_username": p1["username"],
             "player2_id": p2["telegram_id"] if p2 else None,
             "player2_username": p2["username"] if p2 else None,
+            "match_deadline": match_deadline if p2 else None,
+            "reminder_sent": False,
         })
     if rows:
-        sb.table("matches").insert(rows).execute()
+        r = sb.table("matches").insert(rows).execute()
+        return r.data
+    return []
  
  
 def db_get_match_for_user(tid: int, tg_id: int):
@@ -505,38 +511,79 @@ async def run_draw(tournament_id: int):
         pairs.append((p1, p2))
         i += 2
  
-    db_save_matches(tournament_id, pairs)
+    saved_matches = db_save_matches(tournament_id, pairs)
     db_set_tournament_status(tournament_id, "ongoing")
  
-    for p1, p2 in pairs:
-        if p2:
+    for match in saved_matches:
+        p1_id, p1_username = match["player1_id"], match["player1_username"]
+        p2_id, p2_username = match["player2_id"], match["player2_username"]
+ 
+        if p2_id:
             kb1 = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✉️ Raqibga yozish", url=f"https://t.me/{p2['username']}")
+                InlineKeyboardButton(text="✉️ Raqibga yozish", url=f"https://t.me/{p2_username}")
             ]])
             kb2 = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✉️ Raqibga yozish", url=f"https://t.me/{p1['username']}")
+                InlineKeyboardButton(text="✉️ Raqibga yozish", url=f"https://t.me/{p1_username}")
             ]])
             try:
                 await bot.send_message(
-                    p1["telegram_id"],
-                    f"⚔️ Qura tashlandi!\nSizning raqibingiz: @{p2['username']}",
+                    p1_id,
+                    f"⚔️ Qura tashlandi!\nSizning raqibingiz: @{p2_username}\n\n"
+                    f"O'ynash uchun {MATCH_PLAY_HOURS:.0f} soat vaqtingiz bor. "
+                    f"O'ynab bo'lgach, ilovadagi \"📊 Hisob yozish\" tugmasi orqali natijani kiriting.",
                     reply_markup=kb1
                 )
                 await bot.send_message(
-                    p2["telegram_id"],
-                    f"⚔️ Qura tashlandi!\nSizning raqibingiz: @{p1['username']}",
+                    p2_id,
+                    f"⚔️ Qura tashlandi!\nSizning raqibingiz: @{p1_username}\n\n"
+                    f"O'ynash uchun {MATCH_PLAY_HOURS:.0f} soat vaqtingiz bor. "
+                    f"O'ynab bo'lgach, ilovadagi \"📊 Hisob yozish\" tugmasi orqali natijani kiriting.",
                     reply_markup=kb2
                 )
             except Exception as e:
                 logging.warning(f"Xabar yuborishda xato: {e}")
+ 
+            if match.get("match_deadline"):
+                deadline = datetime.fromisoformat(match["match_deadline"].replace("Z", "+00:00")).replace(tzinfo=None)
+                remind_at = deadline - timedelta(hours=2)
+                if remind_at > datetime.utcnow():
+                    scheduler.add_job(
+                        send_match_reminder, "date", run_date=remind_at,
+                        args=[match["id"], p1_id, p1_username, p2_id, p2_username],
+                        id=f"reminder_{match['id']}", replace_existing=True
+                    )
         else:
             try:
                 await bot.send_message(
-                    p1["telegram_id"],
+                    p1_id,
                     "🎉 Sizga bu bosqichda raqib chiqmadi (bye). Keyingi bosqichni kuting."
                 )
             except Exception:
                 pass
+ 
+ 
+async def send_match_reminder(match_id: int, p1_id: int, p1_username: str, p2_id: int, p2_username: str):
+    """Match muddatiga 2 soat qolganda ikkala o'yinchiga eslatma yuboradi."""
+    try:
+        r = sb.table("matches").select("reminder_sent").eq("id", match_id).execute()
+        if not r.data or r.data[0].get("reminder_sent"):
+            return
+        kb1 = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✉️ Raqibga yozish", url=f"https://t.me/{p2_username}")
+        ]])
+        kb2 = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✉️ Raqibga yozish", url=f"https://t.me/{p1_username}")
+        ]])
+        text = (
+            "⏰ <b>Diqqat!</b> O'yiningizni tugatishga <b>2 soat</b> qoldi!\n\n"
+            "Agar belgilangan vaqtda o'ynamasangiz, turnirdan chetlatilishingiz mumkin. "
+            "Raqibingiz bilan tezroq bog'laning ⚡"
+        )
+        await bot.send_message(p1_id, text, parse_mode="HTML", reply_markup=kb1)
+        await bot.send_message(p2_id, text, parse_mode="HTML", reply_markup=kb2)
+        sb.table("matches").update({"reminder_sent": True}).eq("id", match_id).execute()
+    except Exception as e:
+        logging.warning(f"Eslatma yuborishda xato: {e}")
  
  
 async def restore_jobs():
@@ -557,7 +604,8 @@ async def sync_tournaments():
     """
     Har 30 soniyada tekshiradi: Mini App (webapp) orqali admin yangi turnir
     yaratgan bo'lsa, buni bot avtomatik payqab, hammaga xabar yuboradi va
-    muddat tugaganda qura tashlashni rejalashtiradi.
+    muddat tugaganda qura tashlashni rejalashtiradi. Shuningdek, qayta ishga
+    tushgandan keyin yo'qolib qolgan eslatma joblarini ham tiklaydi.
     """
     try:
         r = sb.table("tournaments").select("*").eq("status", "registration").execute()
@@ -577,6 +625,33 @@ async def sync_tournaments():
             if not tour.get("broadcasted"):
                 await broadcast_tournament(tour)
                 sb.table("tournaments").update({"broadcasted": True}).eq("id", tour["id"]).execute()
+ 
+        # Eslatma joblarini tiklash (bot qayta ishga tushganda)
+        mr = (
+            sb.table("matches").select("*")
+            .eq("reminder_sent", False)
+            .not_.is_("match_deadline", "null")
+            .not_.is_("player2_id", "null")
+            .execute()
+        )
+        for match in mr.data:
+            job_id = f"reminder_{match['id']}"
+            if scheduler.get_job(job_id):
+                continue
+            deadline = datetime.fromisoformat(match["match_deadline"].replace("Z", "+00:00")).replace(tzinfo=None)
+            remind_at = deadline - timedelta(hours=2)
+            if remind_at <= datetime.utcnow():
+                await send_match_reminder(
+                    match["id"], match["player1_id"], match["player1_username"],
+                    match["player2_id"], match["player2_username"]
+                )
+            else:
+                scheduler.add_job(
+                    send_match_reminder, "date", run_date=remind_at,
+                    args=[match["id"], match["player1_id"], match["player1_username"],
+                          match["player2_id"], match["player2_username"]],
+                    id=job_id, replace_existing=True
+                )
     except Exception as e:
         logging.warning(f"sync_tournaments xato: {e}")
  
