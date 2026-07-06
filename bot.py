@@ -212,7 +212,8 @@ async def start_handler(message: Message):
     settings = db_get_settings()
  
     if settings["maintenance"] and message.from_user.id != ADMIN_ID:
-        await message.answer("🛠 Hozir texnik ishlar olib borilmoqda. Iltimos, keyinroq qayting.")
+        msg = settings.get("maintenance_message") or "Hozir texnik ishlar olib borilmoqda. Iltimos, keyinroq qayting."
+        await message.answer(f"🛠 {msg}")
         return
  
     caption = f"🏆 <b>{BOT_NAME}</b>\n\neFootball turnirlar botiga xush kelibsiz!\nQuyidagi tugma orqali ilovani oching 👇"
