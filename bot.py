@@ -2,7 +2,13 @@ import os
 import asyncio
 import random
 import logging
+import hmac
+import hashlib
+import json
+from urllib.parse import parse_qsl
 from datetime import datetime, timedelta
+ 
+from aiohttp import web
  
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -30,6 +36,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 MATCH_PLAY_HOURS = float(os.getenv("MATCH_PLAY_HOURS", "24"))
+PORT = int(os.getenv("PORT", "8080"))
  
 if not BOT_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or ADMIN_ID == 0:
     raise RuntimeError(
@@ -657,11 +664,202 @@ async def sync_tournaments():
         logging.warning(f"sync_tournaments xato: {e}")
  
  
+# ===========================================================
+# WEB APP API — Telegram initData orqali xavfsiz tekshiruv
+# ===========================================================
+ 
+def verify_init_data(init_data: str):
+    """
+    Telegram Web App yuborgan initData'ning haqiqiyligini tekshiradi.
+    Agar to'g'ri bo'lsa, ichidagi foydalanuvchi ma'lumotini qaytaradi.
+    Agar soxta yoki buzilgan bo'lsa, None qaytaradi.
+    """
+    try:
+        parsed = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = parsed.pop("hash", None)
+        if not received_hash:
+            return None
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if computed_hash != received_hash:
+            return None
+        user = json.loads(parsed.get("user", "{}"))
+        return user
+    except Exception:
+        return None
+ 
+ 
+@web.middleware
+async def cors_middleware(request, handler):
+    try:
+        response = await handler(request)
+    except web.HTTPException as ex:
+        response = ex
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    return response
+ 
+ 
+async def cors_preflight(request):
+    return web.Response(status=200)
+ 
+ 
+async def api_register(request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        return web.json_response({"ok": False, "error": "auth"}, status=401)
+ 
+    tg_id = user["id"]
+    username = user.get("username")
+ 
+    tour = db_get_active_tournament()
+    if not tour or tour["status"] != "registration":
+        return web.json_response({"ok": False, "error": "no_active_tournament"})
+    if db_is_registered(tour["id"], tg_id):
+        return web.json_response({"ok": False, "error": "already_registered"})
+    if db_count_participants(tour["id"]) >= tour["size"]:
+        return web.json_response({"ok": False, "error": "full"})
+    if not username:
+        return web.json_response({"ok": False, "error": "no_username"})
+ 
+    db_register(tour["id"], tg_id, username)
+    return web.json_response({"ok": True})
+ 
+ 
+async def api_submit_score(request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        return web.json_response({"ok": False, "error": "auth"}, status=401)
+ 
+    tg_id = user["id"]
+    match_id = data.get("match_id")
+    my_score = data.get("my_score")
+    opp_score = data.get("opp_score")
+ 
+    m = sb.table("matches").select("*").eq("id", match_id).execute().data
+    if not m:
+        return web.json_response({"ok": False, "error": "not_found"})
+    match = m[0]
+    if tg_id not in (match["player1_id"], match["player2_id"]):
+        return web.json_response({"ok": False, "error": "not_yours"}, status=403)
+ 
+    is_p1 = tg_id == match["player1_id"]
+    score_reporter = my_score if is_p1 else opp_score
+    score_opponent = opp_score if is_p1 else my_score
+    sb.table("matches").update({
+        "reported_by": tg_id,
+        "score_reporter": my_score,
+        "score_opponent": opp_score,
+        "confirmed": False,
+    }).eq("id", match_id).execute()
+    return web.json_response({"ok": True})
+ 
+ 
+async def api_confirm_score(request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user:
+        return web.json_response({"ok": False, "error": "auth"}, status=401)
+ 
+    tg_id = user["id"]
+    match_id = data.get("match_id")
+    confirm = data.get("confirm", False)
+ 
+    m = sb.table("matches").select("*").eq("id", match_id).execute().data
+    if not m:
+        return web.json_response({"ok": False, "error": "not_found"})
+    match = m[0]
+    if tg_id not in (match["player1_id"], match["player2_id"]) or tg_id == match.get("reported_by"):
+        return web.json_response({"ok": False, "error": "not_allowed"}, status=403)
+ 
+    if confirm:
+        sb.table("matches").update({"confirmed": True}).eq("id", match_id).execute()
+    else:
+        sb.table("matches").update({
+            "reported_by": None, "score_reporter": None,
+            "score_opponent": None, "confirmed": False
+        }).eq("id", match_id).execute()
+    return web.json_response({"ok": True})
+ 
+ 
+async def api_toggle_maintenance(request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user or user["id"] != ADMIN_ID:
+        return web.json_response({"ok": False, "error": "forbidden"}, status=403)
+ 
+    turn_on = data.get("on", False)
+    if turn_on:
+        msg = data.get("message") or "Texnik ishlar boshlandi. Iltimos, birozdan keyin urinib ko'ring."
+        db_set_maintenance(True)
+        sb.table("settings").update({"maintenance_message": msg}).eq("id", 1).execute()
+    else:
+        db_set_maintenance(False)
+    return web.json_response({"ok": True})
+ 
+ 
+async def api_start_tournament(request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user or user["id"] != ADMIN_ID:
+        return web.json_response({"ok": False, "error": "forbidden"}, status=403)
+ 
+    if db_get_active_tournament():
+        return web.json_response({"ok": False, "error": "already_active"})
+ 
+    size = int(data.get("size", 32))
+    hours = float(data.get("hours", 3))
+    deadline = datetime.utcnow() + timedelta(hours=hours)
+    tour = db_create_tournament(size, deadline)
+    scheduler.add_job(
+        run_draw, "date", run_date=deadline,
+        args=[tour["id"]], id=f"draw_{tour['id']}"
+    )
+    return web.json_response({"ok": True})
+ 
+ 
+async def api_stop_tournament(request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user or user["id"] != ADMIN_ID:
+        return web.json_response({"ok": False, "error": "forbidden"}, status=403)
+ 
+    tour = db_get_active_tournament()
+    if not tour:
+        return web.json_response({"ok": False, "error": "no_active_tournament"})
+    db_stop_tournament(tour["id"])
+    try:
+        scheduler.remove_job(f"draw_{tour['id']}")
+    except Exception:
+        pass
+    return web.json_response({"ok": True})
+ 
+ 
 async def main():
     db_get_settings()
     await restore_jobs()
     scheduler.add_job(sync_tournaments, "interval", seconds=30, id="sync_tournaments")
     scheduler.start()
+ 
+    app = web.Application(middlewares=[cors_middleware])
+    app.router.add_post("/api/register", api_register)
+    app.router.add_post("/api/submit_score", api_submit_score)
+    app.router.add_post("/api/confirm_score", api_confirm_score)
+    app.router.add_post("/api/admin/toggle_maintenance", api_toggle_maintenance)
+    app.router.add_post("/api/admin/start_tournament", api_start_tournament)
+    app.router.add_post("/api/admin/stop_tournament", api_stop_tournament)
+    app.router.add_route("OPTIONS", "/{tail:.*}", cors_preflight)
+ 
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info(f"API server {PORT}-portda ishga tushdi...")
+ 
     logging.info("Bot ishga tushdi...")
     await dp.start_polling(bot)
  
